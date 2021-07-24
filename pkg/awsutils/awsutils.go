@@ -192,6 +192,8 @@ type EC2InstanceMetadataCache struct {
 
 	ec2Metadata ec2metadata.EC2Metadata
 	ec2SVC      ec2wrapper.EC2
+
+	dirtyENIs map[string]bool
 }
 
 // ENIMetadata contains information about an ENI
@@ -301,6 +303,7 @@ func New(useCustomNetworking bool) (*EC2InstanceMetadataCache, error) {
 
 	cache := &EC2InstanceMetadataCache{}
 	cache.ec2Metadata = ec2metadata.New()
+	cache.dirtyENIs = make(map[string]bool)
 
 	region, err := cache.ec2Metadata.Region()
 	if err != nil {
@@ -580,7 +583,11 @@ func (cache *EC2InstanceMetadataCache) GetAttachedENIs() (eniList []ENIMetadata,
 		if err != nil {
 			return nil, errors.Wrapf(err, "get attached ENIs: failed to retrieve ENI metadata for ENI: %s", macStr)
 		}
-		enis = append(enis, eniMetadata)
+		if _, ok := cache.dirtyENIs[eniMetadata.ENIID]; !ok {
+			enis = append(enis, eniMetadata)
+		} else {
+			log.Debugf("ignoring adding eni which exists in the dirty pool: %s ", eniMetadata.ENIID)
+		}
 	}
 	return enis, nil
 }
@@ -1109,6 +1116,11 @@ func (cache *EC2InstanceMetadataCache) DescribeAllENIs() (DescribeAllENIsResult,
 	eniMap := make(map[string]ENIMetadata, len(allENIs))
 	var eniIDs []string
 	for _, eni := range allENIs {
+		// if this is a dirty eni that we discovered previously, dont even bother querying for it from the aws store
+		// to save some ec2 api calls
+		if _, ok := cache.dirtyENIs[eni.ENIID]; ok {
+			continue
+		}
 		eniIDs = append(eniIDs, eni.ENIID)
 		eniMap[eni.ENIID] = eni
 	}
@@ -1129,6 +1141,8 @@ func (cache *EC2InstanceMetadataCache) DescribeAllENIs() (DescribeAllENIsResult,
 		if aerr, ok := err.(awserr.Error); ok {
 			if aerr.Code() == "InvalidNetworkInterfaceID.NotFound" {
 				badENIID := badENIID(aerr.Message())
+				// add this to a cache so we can eliminate it from future results
+				cache.dirtyENIs[badENIID] = true
 				log.Debugf("Could not find interface: %s, ID: %s", aerr.Message(), badENIID)
 				// Remove this ENI from the map
 				delete(eniMap, badENIID)
